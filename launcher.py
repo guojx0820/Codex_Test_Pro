@@ -48,6 +48,15 @@ def ensure_venv() -> Path | None:
     return py if py.exists() else None
 
 
+def _ensure_runtime_deps(python_exec: str) -> None:
+    try:
+        code = _run([python_exec, "-m", "pip", "show", "requests"])
+        if code != 0:
+            print("[INFO] Installing runtime dependency: requests")
+            _run([python_exec, "-m", "pip", "install", "requests"])
+    except Exception as exc:  # noqa: BLE001
+        print(f"[WARN] Failed to auto-install requests: {exc}")
+
 def main() -> int:
     if not APP.exists():
         print("[ERROR] app.py not found.")
@@ -55,9 +64,11 @@ def main() -> int:
 
     venv_python = ensure_venv()
     if venv_python:
+        _ensure_runtime_deps(str(venv_python))
         print(f"[INFO] Launching GUI with venv Python: {venv_python}")
         return _run([str(venv_python), str(APP)])
 
+    _ensure_runtime_deps(sys.executable)
     print(f"[INFO] Launching GUI with system Python: {sys.executable}")
     return _run([sys.executable, str(APP)])
 
