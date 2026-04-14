@@ -57,11 +57,12 @@ class SimpleSession:
             headers.update(extra)
         return headers
 
-    def get(self, url: str, params: dict[str, str] | None = None, timeout: int = 45, headers: dict[str, str] | None = None) -> SessionResponse:
+    def get(self, url: str, params: dict[str, str] | None = None, timeout: int = 45, headers: dict[str, str] | None = None, add_auth: bool = True) -> SessionResponse:
         if params:
             q = parse.urlencode(params)
             url = f"{url}?{q}"
-        req = request.Request(url, headers=self._headers(headers))
+        base_headers = self._headers(headers) if add_auth else {"User-Agent": self.user_agent, **(headers or {})}
+        req = request.Request(url, headers=base_headers)
         with request.urlopen(req, timeout=timeout) as resp:
             status = getattr(resp, "status", 200)
             body = resp.read()
@@ -165,7 +166,7 @@ class DownloadEngine:
             "temporal": f"{start_date}T00:00:00Z,{end_date}T23:59:59Z",
             "bounding_box": ",".join(str(x) for x in (bbox or [-180, -90, 180, 90])),
         }
-        resp = session.get(CMR_GRANULES, params=params, timeout=45)
+        resp = session.get(CMR_GRANULES, params=params, timeout=45, add_auth=False)
         resp.raise_for_status()
         entries = json.loads(resp._body.decode("utf-8")).get("feed", {}).get("entry", [])
         items: list[dict[str, Any]] = []
@@ -262,9 +263,24 @@ class DownloadEngine:
                 bad += 1
         return {"ok": ok, "auth": auth, "bad": bad, "checked": min(len(tasks), max_checks)}
 
+
+    def _s3_to_https(self, href: str) -> str:
+        # 仅把 STAC 原始 s3 href 做协议转换，不拼接新路径
+        if not href.startswith("s3://"):
+            return href
+        parsed = parse.urlparse(href)
+        bucket = parsed.netloc
+        key = parsed.path.lstrip("/")
+        region_buckets = {"usgs-landsat": "us-west-2", "sentinel-s1-l1c": "us-west-2"}
+        region = region_buckets.get(bucket)
+        if region:
+            return f"https://{bucket}.s3.{region}.amazonaws.com/{key}"
+        return f"https://{bucket}.s3.amazonaws.com/{key}"
+
     def _asset_href(self, asset: Any) -> str | None:
         if not isinstance(asset, dict):
             return None
+
         alt = asset.get("alternate", {})
         if isinstance(alt, dict):
             https_node = alt.get("https")
@@ -272,13 +288,22 @@ class DownloadEngine:
                 href = https_node.get("href")
                 if isinstance(href, str) and href.startswith("http"):
                     return href
+            s3_node = alt.get("s3")
+            if isinstance(s3_node, dict):
+                href = s3_node.get("href")
+                if isinstance(href, str) and href.startswith("s3://"):
+                    return self._s3_to_https(href)
+
         href = asset.get("href")
-        if isinstance(href, str) and href.startswith("http"):
-            return href
+        if isinstance(href, str):
+            if href.startswith("http"):
+                return href
+            if href.startswith("s3://"):
+                return self._s3_to_https(href)
         return None
 
     def _ext_from_href(self, href_l: str) -> str:
-        path = urlparse(href_l).path.lower()
+        path = parse.urlparse(href_l).path.lower()
         for ext in VALID_EXT:
             if path.endswith(ext):
                 return ext
