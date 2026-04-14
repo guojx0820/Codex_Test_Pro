@@ -110,4 +110,4 @@ chmod +x run.sh
   - 过滤资产数量；
   - 实际下载文件类型。
 
-> 运行依赖：`requests`（如果没有，请先 `pip install requests`）。
+> 运行依赖：v1.4.1 起移除 requests 依赖，默认仅使用 Python 标准库网络模块。
