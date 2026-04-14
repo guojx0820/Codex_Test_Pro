@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import os
 import re
 from dataclasses import dataclass
 from typing import Any, Callable
-from urllib.parse import urlparse
-
-import requests
+from urllib import parse, request
+from urllib.error import HTTPError, URLError
 
 STAC_SEARCH = "https://earth-search.aws.element84.com/v1/search"
 CMR_GRANULES = "https://cmr.earthdata.nasa.gov/search/granules.json"
@@ -29,36 +30,86 @@ class DownloadTask:
     requires_auth: bool = False
 
 
+class SessionResponse:
+    def __init__(self, status_code: int, body: bytes) -> None:
+        self.status_code = status_code
+        self._body = body
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise HTTPError(url="", code=self.status_code, msg=f"HTTP {self.status_code}", hdrs=None, fp=None)
+
+    def iter_content(self, chunk_size: int):
+        for i in range(0, len(self._body), chunk_size):
+            yield self._body[i : i + chunk_size]
+
+
+class SimpleSession:
+    def __init__(self, auth_header: str | None = None) -> None:
+        self.auth_header = auth_header
+        self.user_agent = "RS-Batch-Downloader/1.6"
+
+    def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
+        headers = {"User-Agent": self.user_agent}
+        if self.auth_header:
+            headers["Authorization"] = self.auth_header
+        if extra:
+            headers.update(extra)
+        return headers
+
+    def get(self, url: str, params: dict[str, str] | None = None, timeout: int = 45, headers: dict[str, str] | None = None) -> SessionResponse:
+        if params:
+            q = parse.urlencode(params)
+            url = f"{url}?{q}"
+        req = request.Request(url, headers=self._headers(headers))
+        with request.urlopen(req, timeout=timeout) as resp:
+            status = getattr(resp, "status", 200)
+            body = resp.read()
+            return SessionResponse(status, body)
+
+    def post_json(self, url: str, payload: dict[str, Any], timeout: int = 45) -> dict[str, Any]:
+        data = json.dumps(payload).encode("utf-8")
+        req = request.Request(
+            url,
+            data=data,
+            method="POST",
+            headers=self._headers({"Content-Type": "application/json"}),
+        )
+        with request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+
 class DownloadEngine:
     def __init__(self, logger: Callable[[str], None]) -> None:
         self.log = logger
 
-    def build_session(self, nasa_user: str, nasa_password: str, nasa_token: str) -> requests.Session:
-        session = requests.Session()
-        session.headers.update({"User-Agent": "RS-Batch-Downloader/1.5"})
+    def build_session(self, nasa_user: str, nasa_password: str, nasa_token: str) -> SimpleSession:
+        auth_header = None
         if nasa_token.strip():
-            session.headers.update({"Authorization": f"Bearer {nasa_token.strip()}"})
+            auth_header = f"Bearer {nasa_token.strip()}"
             self.log("NASA认证: 使用Token")
         elif nasa_user.strip() and nasa_password:
-            session.auth = (nasa_user.strip(), nasa_password)
+            raw = f"{nasa_user.strip()}:{nasa_password}".encode("utf-8")
+            auth_header = "Basic " + base64.b64encode(raw).decode("ascii")
             self.log("NASA认证: 使用用户名/密码")
         else:
             self.log("NASA认证: 未配置（MODIS可能401/403）")
-        return session
+        return SimpleSession(auth_header)
 
-    def verify_auth(self, session: requests.Session) -> bool:
+    def verify_auth(self, session: SimpleSession) -> bool:
         try:
-            r = session.get(EARTHDATA_PROFILE, timeout=20, allow_redirects=True)
-            ok = r.status_code < 400
-            self.log(f"NASA认证检测: {'成功' if ok else '失败'} (HTTP {r.status_code})")
+            resp = session.get(EARTHDATA_PROFILE, timeout=20)
+            ok = resp.status_code < 400
+            self.log(f"NASA认证检测: {'成功' if ok else '失败'} (HTTP {resp.status_code})")
             return ok
-        except requests.RequestException as exc:
-            self.log(f"NASA认证检测异常: {exc}")
+        except (HTTPError, URLError) as exc:
+            code = getattr(exc, "code", "ERR")
+            self.log(f"NASA认证检测异常: HTTP {code}")
             return False
 
     def search_dataset(
         self,
-        session: requests.Session,
+        session: SimpleSession,
         dataset: str,
         bbox: list[float] | None,
         geometry: dict[str, Any] | None,
@@ -69,10 +120,11 @@ class DownloadEngine:
     ) -> list[dict[str, Any]]:
         if dataset.startswith("modis"):
             return self._search_modis_cmr(session, dataset, bbox, start_date, end_date, max_items)
-        return self._search_stac(dataset, bbox, geometry, start_date, end_date, max_items, cloud)
+        return self._search_stac(session, dataset, bbox, geometry, start_date, end_date, max_items, cloud)
 
     def _search_stac(
         self,
+        session: SimpleSession,
         dataset: str,
         bbox: list[float] | None,
         geometry: dict[str, Any] | None,
@@ -93,14 +145,12 @@ class DownloadEngine:
             payload["intersects"] = geometry
         if dataset in ["sentinel-2-l2a", "landsat-c2-l2"]:
             payload["query"] = {"eo:cloud_cover": {"lte": cloud}}
-
-        r = requests.post(STAC_SEARCH, json=payload, timeout=45)
-        r.raise_for_status()
-        return r.json().get("features", [])
+        data = session.post_json(STAC_SEARCH, payload, timeout=45)
+        return data.get("features", [])
 
     def _search_modis_cmr(
         self,
-        session: requests.Session,
+        session: SimpleSession,
         dataset: str,
         bbox: list[float] | None,
         start_date: str,
@@ -115,10 +165,9 @@ class DownloadEngine:
             "temporal": f"{start_date}T00:00:00Z,{end_date}T23:59:59Z",
             "bounding_box": ",".join(str(x) for x in (bbox or [-180, -90, 180, 90])),
         }
-        r = session.get(CMR_GRANULES, params=params, timeout=45)
-        r.raise_for_status()
-        entries = r.json().get("feed", {}).get("entry", [])
-
+        resp = session.get(CMR_GRANULES, params=params, timeout=45)
+        resp.raise_for_status()
+        entries = json.loads(resp._body.decode("utf-8")).get("feed", {}).get("entry", [])
         items: list[dict[str, Any]] = []
         for e in entries:
             item_id = e.get("producer_granule_id") or e.get("id") or "modis"
@@ -137,7 +186,6 @@ class DownloadEngine:
 
         tasks: list[DownloadTask] = []
         filtered = 0
-
         for item in items:
             item_id = str(item.get("id", "item"))
             assets = item.get("assets", {})
@@ -161,15 +209,14 @@ class DownloadEngine:
                     filtered += 1
                     continue
 
-                # Sentinel-1 仅下载影像数据
                 if dataset == "sentinel-1-grd" and not href_l.endswith((".tiff", ".tif", ".zip", ".safe")):
                     self.log(f"过滤资产: {asset_key} | href={href} | 原因=非影像")
                     filtered += 1
                     continue
 
                 ext = self._ext_from_href(href_l)
-                if ext == "":
-                    self.log(f"过滤资产: {asset_key} | href={href} | 原因=未知扩展名")
+                if not ext:
+                    self.log(f"过滤资产: {asset_key} | href={href} | 原因=未知扩展")
                     filtered += 1
                     continue
 
@@ -179,7 +226,7 @@ class DownloadEngine:
                         dataset=dataset,
                         item_id=item_id,
                         asset_key=str(asset_key),
-                        url=href,  # 严禁拼接/修改 href
+                        url=href,
                         output_path=os.path.join(ds_dir, filename),
                         file_type=ext,
                         requires_auth=dataset.startswith("modis"),
@@ -191,23 +238,43 @@ class DownloadEngine:
 
         return tasks, filtered
 
+    def precheck_tasks(self, session: SimpleSession, tasks: list[DownloadTask], max_checks: int = 20) -> dict[str, int]:
+        ok = 0
+        auth = 0
+        bad = 0
+        for task in tasks[:max_checks]:
+            try:
+                req = request.Request(task.url, headers=session._headers({"Range": "bytes=0-1023"}))
+                with request.urlopen(req, timeout=20) as resp:
+                    status = getattr(resp, "status", 200)
+                    if status in (200, 206):
+                        ok += 1
+                    elif status in (401, 403):
+                        auth += 1
+                    else:
+                        bad += 1
+            except HTTPError as exc:
+                if exc.code in (401, 403):
+                    auth += 1
+                else:
+                    bad += 1
+            except URLError:
+                bad += 1
+        return {"ok": ok, "auth": auth, "bad": bad, "checked": min(len(tasks), max_checks)}
+
     def _asset_href(self, asset: Any) -> str | None:
         if not isinstance(asset, dict):
             return None
-
-        # Sentinel-1/Landsat 优先使用 STAC 中原生 https alternate，避免手工拼接S3路径
-        alternate = asset.get("alternate", {})
-        if isinstance(alternate, dict):
-            https_node = alternate.get("https")
+        alt = asset.get("alternate", {})
+        if isinstance(alt, dict):
+            https_node = alt.get("https")
             if isinstance(https_node, dict):
                 href = https_node.get("href")
                 if isinstance(href, str) and href.startswith("http"):
                     return href
-
         href = asset.get("href")
         if isinstance(href, str) and href.startswith("http"):
             return href
-
         return None
 
     def _ext_from_href(self, href_l: str) -> str:
@@ -230,47 +297,47 @@ class DownloadEngine:
         digest = hashlib.md5(f"{item_id}|{asset_key}|{href}".encode("utf-8")).hexdigest()[:8]
         return f"{base}_{digest}{ext}"
 
-    def download_one(self, session: requests.Session, task: DownloadTask, retry: int, resume: bool) -> bool:
+    def download_one(self, session: SimpleSession, task: DownloadTask, retry: int, resume: bool) -> bool:
         attempts = retry + 1
-        for attempt in range(attempts):
+        for i in range(attempts):
             try:
                 if task.dataset.startswith("modis"):
                     return self._download_with_session(session, task.url, task.output_path)
-                return self._download_with_requests(task.url, task.output_path, resume)
-            except requests.RequestException as exc:
-                if attempt == attempts - 1:
+                return self._download_with_urllib(session, task.url, task.output_path, resume)
+            except (HTTPError, URLError, OSError) as exc:
+                if i == attempts - 1:
                     self.log(f"下载失败: {task.url} ({exc})")
-            except OSError as exc:
-                self.log(f"文件写入失败: {task.output_path} ({exc})")
-                return False
         return False
 
-    def _download_with_session(self, session: requests.Session, url: str, path: str) -> bool:
-        r = session.get(url, stream=True, timeout=120, allow_redirects=True)
-        r.raise_for_status()
+    def _download_with_session(self, session: SimpleSession, url: str, path: str) -> bool:
+        # MODIS: 必须用 session.get 走认证头
+        resp = session.get(url, timeout=120)
+        resp.raise_for_status()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "wb") as f:
-            for chunk in r.iter_content(8192):
+            for chunk in resp.iter_content(8192):
                 if chunk:
                     f.write(chunk)
         return True
 
-    def _download_with_requests(self, url: str, path: str, resume: bool) -> bool:
-        headers: dict[str, str] = {"User-Agent": "RS-Batch-Downloader/1.5"}
-        mode = "wb"
+    def _download_with_urllib(self, session: SimpleSession, url: str, path: str, resume: bool) -> bool:
         existing = os.path.getsize(path) if (resume and os.path.exists(path)) else 0
+        headers = {"User-Agent": session.user_agent}
+        mode = "wb"
         if existing > 0:
             headers["Range"] = f"bytes={existing}-"
             mode = "ab"
 
-        r = requests.get(url, stream=True, timeout=120, headers=headers)
-        r.raise_for_status()
-        if r.status_code == 200 and mode == "ab":
-            mode = "wb"
-
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, mode) as f:
-            for chunk in r.iter_content(1024 * 1024):
-                if chunk:
+        req = request.Request(url, headers=session._headers(headers))
+        with request.urlopen(req, timeout=120) as resp:
+            status = getattr(resp, "status", 200)
+            if status == 200 and mode == "ab":
+                mode = "wb"
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, mode) as f:
+                while True:
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
                     f.write(chunk)
         return True

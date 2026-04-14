@@ -121,6 +121,7 @@ class RemoteSensingDownloaderApp:
         action.pack(fill=tk.X, pady=6)
         self.start_button = ttk.Button(action, text="开始批量下载", command=self.start_download)
         self.start_button.pack(side=tk.LEFT)
+        ttk.Button(action, text="下载前链路预检", command=self.precheck_download_links).pack(side=tk.LEFT, padx=8)
         ttk.Button(action, text="查看历史任务", command=self.show_history).pack(side=tk.LEFT, padx=8)
         self.progress = ttk.Progressbar(action, mode="indeterminate")
         self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=10)
@@ -200,6 +201,40 @@ class RemoteSensingDownloaderApp:
             max(0, int(self.retry_var.get())),
             min(16, max(1, int(self.workers_var.get()))),
         )
+
+
+    def precheck_download_links(self) -> None:
+        try:
+            datasets, bbox, geometry, max_items, asset_limit, cloud, retry, workers = self._validate()
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("输入错误", str(exc))
+            return
+
+        try:
+            session = self.engine.build_session(self.nasa_user_var.get(), self.nasa_password_var.get(), self.nasa_token_var.get())
+            self.engine.verify_auth(session)
+
+            all_tasks: list[DownloadTask] = []
+            for ds in datasets:
+                items = self.engine.search_dataset(
+                    session, ds, bbox, geometry, self.start_date_var.get(), self.end_date_var.get(), max_items, cloud
+                )
+                tasks, filtered = self.engine.build_tasks(ds, items, self.output_dir_var.get(), asset_limit)
+                self.log(f"预检-{ds}: 记录{len(items)} 条, 可下载任务{len(tasks)} 个, 过滤{filtered} 个")
+                all_tasks.extend(tasks)
+
+            result = self.engine.precheck_tasks(session, all_tasks, max_checks=30)
+            msg = (
+                f"预检完成\n"
+                f"检查任务数: {result['checked']}\n"
+                f"可下载: {result['ok']}\n"
+                f"需认证/认证失败: {result['auth']}\n"
+                f"预计失败: {result['bad']}"
+            )
+            self.log(msg.replace("\n", " | "))
+            messagebox.showinfo("链路预检结果", msg)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("预检失败", str(exc))
 
     def start_download(self) -> None:
         if self.is_running:
