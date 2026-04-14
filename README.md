@@ -93,3 +93,21 @@ chmod +x run.sh
 - **CMR 结果自动提取 granule 数据链接**，支持批量下载。
 
 建议：在 Windows 中将输出目录设置为较短路径（如 `D:\RS`）以获得更高稳定性。
+
+
+## v1.4 认证与资产过滤修复
+
+- 新增 `download.py` 下载引擎，按数据源分流：
+  - MODIS (`modis-13q1-061`, `modis-09a1-061`) 走 **NASA CMR API + Earthdata认证**；
+  - 其他数据集走 STAC API。
+- GUI 新增 NASA 认证输入：用户名、密码、Token（MODIS 推荐填写）。
+- Sentinel-1 资产选择改为：优先 `data` / `product`，并过滤 `schema/metadata/thumbnail/overview`。
+- 下载链接严格过滤：
+  - 仅保留 `.hdf/.tif/.tiff/.zip/.SAFE`；
+  - 丢弃 `This_link...` 和 HTML 链接。
+- 日志新增：
+  - 认证检测结果；
+  - 过滤资产数量；
+  - 实际下载文件类型。
+
+> 运行依赖：`requests`（如果没有，请先 `pip install requests`）。
