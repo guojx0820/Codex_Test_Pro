@@ -68,3 +68,18 @@ chmod +x run.sh
 - 断点续传与失败重试；
 - 按卫星传感器预设波段批量下载；
 - 任务队列与历史任务管理。
+
+
+## v1.2 新增能力
+
+- 修复 Landsat/Sentinel-1 的 `s3://` 下载失败问题：自动转换为公开 `https://bucket.s3.amazonaws.com/...` 链接。
+- 增加断点续传（Range）与失败自动重试。
+- 增加矢量边界输入：支持 BBox / GeoJSON / Shapefile（Shapefile 需安装 `pyshp`）。
+- 增加按传感器预设波段批量下载（每景可设置资产数量）。
+- 增加任务历史记录（`task_history.json`）和“查看历史任务”。
+- 新增数据集选项：`modis-13q1-061`、`modis-09a1-061`、`goci-l2`（实际可用性受上游 STAC 服务支持情况影响）。
+
+## 注意
+
+- 若下载任务超时，程序会自动重试；网络不稳定时可适当减少“每数据集最多景数”并增大重试次数。
+- 如果选择 Shapefile 输入，请先执行：`pip install pyshp`。
